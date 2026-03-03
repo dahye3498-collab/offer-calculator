@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>오퍼가 계산기 Standalone</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo } = React;
+
+        // --- Core Logic (Previously in lib/) ---
+        
+        function normalizeProductName(rawName) {
+            let grade = '';
+            let name = rawName.toUpperCase().trim();
+            const gradePatterns = [/\*S\*/g, /\bA\b/g, /\bAF\b/g, /\bB\b/g, /\bCHOICE\b/g, /\bPRIME\b/g];
+            gradePatterns.forEach(pattern => {
+                const matches = name.match(pattern);
+                if (matches) {
+                    grade = matches.join(' ');
+                    name = name.replace(pattern, '').replace(/\s+/g, ' ').trim();
+                }
+            });
+            if (name.endsWith('S') && name.length > 4) name = name.substring(0, name.length - 1);
+            return { name, grade };
+        }
+
+        function extractSpecs(description) {
+            const specs = { weight: '', ratio: '', pack: '' };
+            const weightMatch = description.match(/(\d+\s*(kg|lb|mt|G))/i);
+            if (weightMatch) specs.weight = weightMatch[0];
+            const ratioMatch = description.match(/(\d+\/\d+|\d+vl)/i);
+            if (ratioMatch) specs.ratio = ratioMatch[0];
+            const packMatch = description.match(/(vacuum|iwp|ivp|poly|wrapped|box)/i);
+            if (packMatch) specs.pack = packMatch[0];
+            return specs;
+        }
+
+        function parseOfferText(text) {
+            const lines = text.split('\n');
+            const items = [];
+            const meta = [];
+            const errors = [];
+            const itemRegex = /^(\d+)x(\d+)(FCL|LCL)?\s+(frozen|chilled|frozen\/chilled)\s+(.*?)\s*@\s*\$(\d+(\.\d+)?)/i;
+
+            lines.forEach((line, index) => {
+                const trimmedLine = line.trim();
+                if (!trimmedLine) return;
+                const match = trimmedLine.match(itemRegex);
+                if (match) {
+                    const desc = match[5].trim();
+                    const { name, grade } = normalizeProductName(desc);
+                    const specs = extractSpecs(desc);
+                    items.push({
+                        id: `item-${index}`,
+                        line_no: index + 1,
+                        container_count: parseInt(match[1]),
+                        container_size_ft: match[2] + (match[3] || 'FCL'),
+                        status: match[4].toLowerCase(),
+                        grade_mark: grade,
+                        product_name: name,
+                        normalized_key: name.replace(/\s+/g, '_').toLowerCase(),
+                        original_description: trimmedLine,
+                        weight_spec: specs.weight,
+                        ratio_spec: specs.ratio,
+                        pack_spec: specs.pack,
+                        usd_per_kg: parseFloat(match[6]),
+                    });
+                } else {
+                    if (trimmedLine.includes('@') || trimmedLine.includes('$')) {
+                        errors.push({ line_no: index + 1, original_text: trimmedLine, reason: '패턴 매칭 실패' });
+                    } else {
+                        meta.push(trimmedLine);
+                    }
+                }
+            });
+            return { items, meta, errors };
+        }
+
+        // --- App Component ---
+
+        const INITIAL_OFFER_TEXT = `FEBUARY / MARCH SHIPMENT
+Brand: PREMIUM BEEF CO.
+Offers subject to final confirmation
+
+1x40FCL frozen BEEF STRIPLOINS *S* @ $8.50
+2x40FCL frozen BEEF CUBE ROLLS A @ $9.20
+1x40FCL chilled BEEF CHUCK EYE ROLLS @ $7.80
+1x20FCL frozen PORK COLLAR AF @ $4.50
+1x40FCL frozen BEEF TENDERS *S* @ $12.00
+
+Terms: CIF Busan, 30 days credit.`;
+
+        const INITIAL_DUTY_MAP = {
+            'beef_striploin': 40,
+            'beef_cube_roll': 40,
+            'beef_chuck_eye_roll': 40,
+            'pork_collar': 22.5,
+            'beef_tender': 40,
+        };
+
+        function App() {
+            const [offerText, setOfferText] = useState(INITIAL_OFFER_TEXT);
+            const [fxRate, setFxRate] = useState(1320.5);
+            const [miscCost, setMiscCost] = useState(100);
+            const [dutyMap, setDutyMap] = useState(INITIAL_DUTY_MAP);
+            const [shouldRound, setShouldRound] = useState(true);
+            const [parseResult, setParseResult] = useState({ items: [], meta: [], errors: [] });
+            const [searchTerm, setSearchTerm] = useState('');
+            const [showUnmatchedOnly, setShowUnmatchedOnly] = useState(false);
+
+            useEffect(() => { handleParse(); }, []);
+
+            const handleParse = () => {
+                setParseResult(parseOfferText(offerText));
+            };
+
+            const formatKrw = (val) => {
+                if (shouldRound) return Math.round(val).toLocaleString('ko-KR');
+                return val.toLocaleString('ko-KR', { maximumFractionDigits: 2 });
+            };
+
+            const calculations = useMemo(() => {
+                return parseResult.items.map(item => {
+                    const base = item.usd_per_kg * fxRate;
+                    const dutyRate = dutyMap[item.normalized_key] || 0;
+                    const hasMatch = dutyMap[item.normalized_key] !== undefined;
+                    const dutyKrw = base * (dutyRate / 100);
+                    const total = base + dutyKrw + miscCost;
+                    return { item, base, dutyRate, hasMatch, dutyKrw, total };
+                });
+            }, [parseResult, dutyMap, fxRate, miscCost]);
+
+            const filtered = calculations.filter(r => {
+                const matchesSearch = r.item.product_name.toLowerCase().includes(searchTerm.toLowerCase());
+                const matchesUnmatched = showUnmatchedOnly ? !r.hasMatch : true;
+                return matchesSearch && matchesUnmatched;
+            });
+
+            const downloadCSV = () => {
+                const headers = ['Line', 'Container', 'Status', 'Product', 'USD/kg', 'FX', 'Base KRW', 'Duty%', 'Total KRW'];
+                const rows = filtered.map(r => [r.item.line_no, `${r.item.container_count}x${r.item.container_size_ft}`, r.item.status, r.item.product_name, r.item.usd_per_kg, fxRate, r.base.toFixed(0), r.dutyRate, r.total.toFixed(0)]);
+                const csvContent = "\uFEFF" + [headers, ...rows].map(e => e.join(",")).join("\n");
+                const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement("a");
+                link.href = URL.createObjectURL(blob);
+                link.download = "offer_costs.csv";
+                link.click();
+            };
+
+            return (
+                <div className="p-6 max-w-[1400px] mx-auto">
+                    <header className="mb-8 flex justify-between items-center">
+                        <div>
+                            <h1 className="text-3xl font-extrabold text-indigo-700">오퍼가 계산기 Standalone</h1>
+                            <p className="text-slate-500">제품 오퍼 파싱 및 원가 계산 도구</p>
+                        </div>
+                        <div className="flex gap-2">
+                             <button onClick={downloadCSV} className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg font-bold shadow-sm transition">CSV 저장</button>
+                             <button onClick={() => { navigator.clipboard.writeText(JSON.stringify(parseResult, null, 2)); alert('복사됨'); }} className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-bold shadow-sm transition">JSON 복사</button>
+                        </div>
+                    </header>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className="lg:col-span-1 space-y-6">
+                            <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                <h2 className="font-bold mb-3">오퍼 원문</h2>
+                                <textarea className="w-full h-80 p-3 border rounded-lg text-sm bg-slate-50" value={offerText} onChange={e => setOfferText(e.target.value)} />
+                                <button onClick={handleParse} className="w-full mt-4 bg-indigo-700 hover:bg-indigo-800 text-white py-3 rounded-lg font-bold shadow-md transition">표 만들기 (파크 실행)</button>
+                            </div>
+
+                            <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                <h2 className="font-bold mb-3">계산 설정</h2>
+                                <div className="space-y-4">
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-400 block mb-1">환율 (USD/KRW)</label>
+                                        <input type="number" className="w-full border p-2 rounded-md" value={fxRate} onChange={e => setFxRate(parseFloat(e.target.value))} />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-bold text-slate-400 block mb-1">제잡비 (KRW/kg)</label>
+                                        <input type="number" className="w-full border p-2 rounded-md" value={miscCost} onChange={e => setMiscCost(parseFloat(e.target.value))} />
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                        <input type="checkbox" id="round" checked={shouldRound} onChange={e => setShouldRound(e.target.checked)} />
+                                        <label htmlFor="round" className="text-sm font-medium cursor-pointer">원단위 반올림</label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="lg:col-span-2 space-y-6">
+                            <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                <h2 className="font-bold mb-2">관세율 매핑 관리</h2>
+                                <p className="text-xs text-slate-400 mb-4 font-medium italic">"부위별 관세율을 여기서 관리합니다. 상품 키(product_key)는 정규화된 부위명입니다."</p>
+                                <div className="max-h-40 overflow-y-auto">
+                                    <table className="w-full text-xs text-left">
+                                        <thead className="bg-slate-50"><tr><th className="p-2">Product Key</th><th className="p-2">Duty %</th><th className="p-2">Action</th></tr></thead>
+                                        <tbody>
+                                            {Object.entries(dutyMap).map(([k, v]) => (
+                                                <tr key={k} className="border-t">
+                                                    <td className="p-2 font-mono">{k}</td>
+                                                    <td className="p-2"><input type="number" className="border w-16 p-1 rounded" value={v} onChange={e => setDutyMap({...dutyMap, [k]: parseFloat(e.target.value)})} /></td>
+                                                    <td className="p-2"><button onClick={() => { const n = {...dutyMap}; delete n[k]; setDutyMap(n); }} className="text-red-500">삭제</button></td>
+                                                </tr>
+                                            ))}
+                                            <tr className="border-t">
+                                                <td colSpan="3" className="p-2"><button onClick={() => { const k = prompt('Key?'); const r = prompt('%?'); if(k&&r) setDutyMap({...dutyMap, [k.toLowerCase().replace(/\s+/g,'_')]: parseFloat(r)}); }} className="text-indigo-600 font-bold">+ 추가</button></td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                                <div className="p-4 border-b flex justify-between items-center bg-slate-50/50">
+                                    <div className="flex gap-4 items-center">
+                                        <input type="text" placeholder="부위명 검색..." className="border p-2 rounded-lg text-xs" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} />
+                                        <div className="flex items-center gap-1">
+                                            <input type="checkbox" id="unmatch" checked={showUnmatchedOnly} onChange={e => setShowUnmatchedOnly(e.target.checked)} />
+                                            <label htmlFor="unmatch" className="text-xs font-medium cursor-pointer">미매칭만 보기</label>
+                                        </div>
+                                    </div>
+                                    <span className="text-[10px] text-slate-400 font-bold uppercase">{filtered.length} items found</span>
+                                </div>
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-xs text-left border-collapse">
+                                        <thead className="bg-slate-100 text-slate-500 font-bold uppercase tracking-tight">
+                                            <tr>
+                                                <th className="p-3">No</th>
+                                                <th className="p-3">Info</th>
+                                                <th className="p-3">Product</th>
+                                                <th className="p-3">Price</th>
+                                                <th className="p-3">Duty %</th>
+                                                <th className="p-3 text-right text-indigo-700">Total KRW</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-100">
+                                            {filtered.map(r => (
+                                                <tr key={r.item.id} className="hover:bg-slate-50">
+                                                    <td className="p-3 text-slate-400">{r.item.line_no}</td>
+                                                    <td className="p-3 font-medium">{r.item.container_count}x{r.item.container_size_ft} <span className="opacity-50 mx-1">|</span> {r.item.status}</td>
+                                                    <td className="p-3">
+                                                        <div className="font-bold">{r.item.product_name}</div>
+                                                        <div className="text-[10px] text-slate-400">{r.item.grade_mark || '-'} <span className="mx-1">•</span> {r.item.weight_spec}</div>
+                                                    </td>
+                                                    <td className="p-3 font-mono text-blue-600">${r.item.usd_per_kg.toFixed(2)}</td>
+                                                    <td className="p-3">
+                                                        {r.hasMatch ? <span className="font-bold">{r.dutyRate}%</span> : <span className="bg-rose-100 text-rose-600 px-1.5 py-0.5 rounded text-[10px] font-bold">미매칭</span>}
+                                                    </td>
+                                                    <td className="p-3 text-right">
+                                                        <div className="text-sm font-black text-indigo-700">{formatKrw(r.total)} 원</div>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
